@@ -1,0 +1,285 @@
+---
+title: "practicalmachinelearningwriteup"
+author: "Roel M. Hogervorst"
+date: "2016-05-15"
+output:
+  html_document:
+    theme: journal
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# Introduction
+
+This is a report describing how I applied machine learning techniques to 
+predict the manner of barbell lifts for 6 people. This is part of the 
+Coursera course practical machine learning. 
+
+This project is performed in 
+R (version 3.2.4 Revised (2016-03-16 r70336) using Rstudio (0.99.893). 
+Packages used: caret (6.0-68), dplyr (0.4.3), foreach ( 1.4.3), ggplot2   (2.1.0), readr (0.2.2) and dependent packages. 
+
+
+### description of experiment
+*(from the [weight lift exercise dataset website](http://groupware.les.inf.puc-rio.br/har))*
+
+Six young healthy participants were asked to perform one set of 
+10 repetitions of the Unilateral Dumbbell Biceps Curl in five
+different fashions: exactly according to the specification (Class A),
+throwing the elbows to the front (Class B), lifting the dumbbell 
+only halfway (Class C), lowering the dumbbell only halfway (Class D)
+and throwing the hips to the front (Class E).
+
+Class A corresponds to the specified execution of the exercise,
+while the other 4 classes correspond to common mistakes
+
+The participants had accelerometers on the belt, forearm, arm, and dumbell. 
+
+### description of data
+
+```{r setup packages and files}
+suppressMessages(library(dplyr))
+suppressMessages(library(ggplot2))
+suppressMessages(library(caret))
+trainingsetloc <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testsetloc <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+suppressMessages(library(randomForest))
+suppressMessages(library(rpart))
+suppressMessages(library(caTools))
+library(foreach)
+library(doParallel)
+registerDoParallel(4) # this really helped a lot in speed.
+```
+
+```{r loading of trainingset, cache=TRUE}
+suppressWarnings(weightlift.train <- readr::read_csv(trainingsetloc))
+names(weightlift.train)[1] <- "rownumber" # readr doesn't give col 1 a name. 
+dim(weightlift.train)
+```
+
+The trainingdataset contains 19622 rows and 160 variables. Per measurement
+location roll pitch and yaw, gyroscopic movement , accelaration and magnetic information in x,y,z directions was collected. 
+For roll pitch and yaw of each of the four sensors the authors 
+calculated eight features: mean, variance,
+standard deviation, max, min, amplitude, kurtosis and skew-
+ness, generating in total 96 derived feature sets. [^1]
+
+
+#  My approach
+
+The dataset contains many measurments in a time frame that I don't understand 
+but at least many per second. One of my thoughts was to combine the 
+measures close to eachother in time and perhaps calculate some 
+features per movement. There is a cyclical pattern in some variables, f.i.:
+
+```{r }
+weightlift.train %>% filter(user_name == "carlitos" & num_window == 12) %>%
+    ggplot(aes(raw_timestamp_part_2, roll_belt)) + 
+    geom_point() + geom_smooth()
+```
+
+But when I combined multiple people or multiple windows, I couldn't make this work. Ultimately I couldn't find an intuitive way to combine windows, users and timestamps.
+I decided to start simple and find variables that combined well together.
+Since the avarage extracted features engineered by the original authors
+were only in part of rows and should be the same over identical windows I
+decided to exclude those created features while including the window numbers, time stamps and user names. 
+
+I created a normal dataset (excluding the created features) and a 
+preprocessed dataset based on centering, scaling and Principal components analyses. Those datasets (`weightlift.train[,-not_trainingset]` and
+`pcatrainingset` respectively) were used with several models.
+I tried classification with rpart, random forests and logitboost.
+Rpart is a simple classification tree algorythm, random forest is an ensemble of multiple classification trees. Logitboost is an ensamble of  logistic regressions. 
+
+I used cross validation 25 fold on every approach.
+
+First a description of feature extraction.
+
+## Feature extraction with PCA
+
+I needed a vector of variables (columns) per bodypart but excluding the 
+features that the original authors created.
+
+```{r selecting non relevant information}
+nogo <- c(1:7,  # identifiers
+    grep("max_", names(weightlift.train)), # find names that have max_
+    grep("min_", names(weightlift.train)),
+    grep("var_", names(weightlift.train)),
+    grep("stddev_", names(weightlift.train)),
+    grep("avg_", names(weightlift.train)),
+    grep("amplitude_", names(weightlift.train)),
+    grep("skewness_", names(weightlift.train)),
+    grep("kurtosis_", names(weightlift.train)),
+    160 # classe it self.
+)
+# creation of variables.
+belt <-  c(1:160)[-nogo][grep("belt",names(weightlift.train[,-nogo]) )]
+arm<- c(1:160)[-nogo][grep("_arm",names(weightlift.train[,-nogo]) )]
+dumbbel<-c(1:160)[-nogo][grep("dumbbell",names(weightlift.train[,-nogo]) )]
+forearm<-c(1:160)[-nogo][grep("_forearm",names(weightlift.train[,-nogo]) )]
+# could probably been done simpler
+```
+
+Then principal components analyses (PCA) per bodypart.
+I looked at the cumulative proportion of components. 
+Since this information is very ugly I excluded the output below.
+
+```{r pca per bodypart, eval=FALSE}
+# checking for principal components best solutions.
+summary(princomp(weightlift.train[belt])) # 3 comp
+summary(princomp(weightlift.train[,-nogo][,arm])) #2 comp
+summary(princomp(na.omit(weightlift.train[,-nogo][,dumbbel]))) # missing values. 
+# 3 com is 91%. 4 = 97
+summary(princomp(na.omit(weightlift.train[,forearm]))) #5 makes 96%
+```
+
+With the knowledge of number of components that would capture at least 95% of variance I created several datasets that would capture the information in the original dataset. 
+
+### Preprocessing the dataset into distinct dataset. 
+
+```{r pca , cache=TRUE}
+#building preprocess functions to save space and to make things 
+#easier to read. 
+preprocessingfunction <- function(dataset, columnvector, n_components) {
+    preobject <- preProcess(dataset[columnvector], 
+                            method= c("pca", "center", "scale"), 
+                            pcaComp = n_components,
+                            na.remove = TRUE)
+    preobject
+} # need those objects later for testset. can't do a new pca on that set off course.
+createpredataframe <- function(preobject, dataset, columnvector){
+    df <- predict(preobject, dataset[columnvector])
+    names(df) <- paste0(deparse(substitute(columnvector)),"_", names(df))
+    df
+}
+# objects
+belt_object <- preprocessingfunction(weightlift.train, belt, 3)
+arm_object <- preprocessingfunction(weightlift.train, arm, 2)
+dumbbel_object <- preprocessingfunction(weightlift.train, dumbbel, 3)
+forearm_object <- preprocessingfunction(weightlift.train, forearm, 3)
+# dframes
+df_belt <- createpredataframe(belt_object,weightlift.train, belt )
+df_arm <- createpredataframe(arm_object,weightlift.train, arm )
+df_forearm <- createpredataframe(forearm_object,weightlift.train, forearm )
+df_dumbbel <- createpredataframe(dumbbel_object,weightlift.train, dumbbel )
+# combining dataset into one trainingset
+pcatrainingset <-weightlift.train %>%
+    select(2:7,160) %>%  # only select identifiers and classe
+    cbind(df_belt, df_arm, df_forearm, df_dumbbel) # add pcacomponents
+not_trainingset <- nogo[-c(2:7, 108)] # nogo but with identifiers and classe
+```
+
+## Building the  models
+
+I used the standard options in rpart but after a few trial and errors
+chose to set some maximum values for other algorytms. 
+The random forest with standard options took so long that I killed the process after an hour. I later restricted the forests and used parallel processing. I started small and upped the maximum values to see if the accuracy would go up, I stopped when I 
+reached ~ 98 % accuracy. Because I think the model would be overtrained. 
+Perhaps I have already overtrained the models with that threshold, 
+however the values are calculated with cross validation so the 
+effect should be a bit more robust against overtraining. 
+
+```{r models, cache=TRUE}
+# crossvalidation set up
+train_control<- trainControl(method="cv", number=25, savePredictions = TRUE)
+# rpart with simple trainingset
+set.seed(2356)
+simple_model <- train(classe ~ ., 
+                      data = weightlift.train[,-not_trainingset], 
+                      method = "rpart",
+                      trControl=train_control)
+# rpart with preprocessed file.
+set.seed(2356)
+bodypca_model<- train(classe ~ ., data = pcatrainingset, 
+      method = "rpart", trControl=train_control)
+# random forest on simple trainingset
+set.seed(2346)
+basic_rf <- train(classe ~ ., 
+                  data = weightlift.train[,-not_trainingset], 
+                  trControl=train_control,
+                  method = "rf", maxnodes=80, ntree=5)
+# random forest on preprocessed file
+set.seed(2346)
+bodypca_rf <- train(classe ~ ., data = pcatrainingset, trControl=train_control,
+                    method = "rf", maxnodes=120, ntree=7)
+# logitboost on simple trainingset
+set.seed(2346)
+basic_logitboost <- train(classe ~ ., data = weightlift.train[,-not_trainingset], 
+                          trControl=train_control,
+                          method = "LogitBoost", nIter =4 )
+# logitboost on preprocessed file
+set.seed(2346)
+bodypca_logitboost <- train(classe ~ ., 
+                          data = pcatrainingset, 
+                          trControl=train_control,
+                          method = "LogitBoost", nIter =4 )
+```
+
+
+## Evaluating the models
+```{r summaries}
+confusionMatrix(simple_model)
+confusionMatrix(bodypca_model)
+confusionMatrix(basic_rf)
+confusionMatrix(bodypca_rf)
+confusionMatrix(basic_logitboost)
+confusionMatrix(bodypca_logitboost)
+```
+
+A simple classification tree is not good enough, only 53% percent
+accuracy. Using PCA to extract features, does not help much, still 53% accuracy. Using Random Forests is much better: 98%. Using the PCA dataset is also really good. The logitboost also performs well with 97% and 
+and 98% accuracy. 
+
+My final choice for the model is a combination of logitboost and random forest  on the testset  and random forest on pca set. 
+
+My expected out of sample error would be around 90%. Theoretically
+the error would be $(0.97)\times(0.98)\times(0.98)$ But the predictors are not entirely independent. And there is already some combination at the logitboost and random forest models. 
+
+# Final prediction for testset
+I will just use the models and decide by majority vote.
+
+
+```{r testset readying}
+suppressWarnings(weightlift.test <- readr::read_csv(testsetloc))
+names(weightlift.test)[1] <- "rownumber"
+# not we need to create a pca version of this set using the 
+# preProcess objects created and not a new pca.
+# Since the names are identical this is not a problem.
+tdf_belt <- createpredataframe(belt_object,weightlift.test, belt )
+tdf_arm <- createpredataframe(arm_object,weightlift.test, arm )
+tdf_forearm <- createpredataframe(forearm_object,weightlift.test, forearm )
+tdf_dumbbel <- createpredataframe(dumbbel_object,weightlift.test, dumbbel )
+
+pcatestset <-weightlift.test %>%
+    select(2:7,160) %>%  # only select identifiers and classe
+    cbind(tdf_belt, tdf_arm, tdf_forearm, tdf_dumbbel)
+normaltestset <- weightlift.test[-not_trainingset]
+```
+
+Creating prediction for the three models.
+Since I do not want to give away spoilers I do not show the results of this 
+assignment. 
+
+```{r predictions, eval=FALSE}
+normal_rf <- predict(basic_rf, normaltestset)
+pca_rf <- predict(bodypca_rf, pcatestset)
+pca_lb <-predict(bodypca_logitboost, pcatestset)
+finalprediction <- data.frame( pca_rf, pca_lb, normal_rf)
+Mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+finalprediction$vote <- apply(finalprediction, 1, Mode)
+finalprediction$vote
+```
+
+
+
+
+# Reference
+
+[^1]: Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013. Read more: <http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises#ixzz48j1BZqba>
